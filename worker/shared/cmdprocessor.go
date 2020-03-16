@@ -40,6 +40,7 @@ import (
 // CmdProcessorAdapter is interface for differentiating the specific database implementations.
 // For example there is an adapter for MySQL, another for Oracle
 type CmdProcessorAdapter interface {
+	MakeSqlParser() (common.SQLParser, error)
 	GetColTypeMap() map[string]int
 	Heartbeat(*sql.DB) bool
 	InitDB() (*sql.DB, error)
@@ -102,6 +103,7 @@ type CmdProcessor struct {
 	// prepared statement yet to be executed.
 	//
 	stmt *sql.Stmt
+	didExecAtPrepare bool
 	//
 	// tells if the current SQL is a query which returns result set (i.e. SELECT)
 	//
@@ -233,6 +235,7 @@ outloop:
 		if cp.calSessionTxn == nil {
 			cp.calSessionTxn = cal.NewCalTransaction(cal.TransTypeAPI, cp.calSessionTxnName, cal.TransOK, "", cal.DefaultTGName)
 		}
+		cp.calSessionTxn.SendSQLData(string(ns.Payload))
 		cp.sqlHash = utility.GetSQLHash(string(ns.Payload))
 		cp.queryScope.SqlHash = fmt.Sprintf("%d", cp.sqlHash)
 		cp.calExecTxn = cal.NewCalTransaction(cal.TransTypeExec, fmt.Sprintf("%d", cp.sqlHash), cal.TransOK, "", cal.DefaultTGName)
@@ -243,7 +246,19 @@ outloop:
 			cp.stmt.Close()
 			cp.stmt = nil
 		}
-		if cp.tx != nil {
+		cp.didExecAtPrepare = false
+		if cp.sqlParser.MustExecInsteadOfPrepare(sqlQuery) {
+			cp.didExecAtPrepare = true
+			if logger.GetLogger().V(logger.Debug) {
+				logger.GetLogger().Log(logger.Debug, "didExecAtPrepare: exec'ing at prepare")
+			}
+			_, err = cp.tx.Exec(sqlQuery)
+			cp.calExecTxn.AddDataStr("directExec","t")
+			cp.calExecTxn.Completed()
+			cp.calExecTxn = nil
+			// keep cp.stmt nil so we don't exec
+			cp.stmt = nil
+		} else if cp.tx != nil {
 			cp.stmt, err = cp.tx.Prepare(sqlQuery)
 		} else {
 			cp.stmt, err = cp.db.Prepare(sqlQuery)
@@ -534,7 +549,19 @@ outloop:
 				}
 			}
 		} else {
-			if cp.inTrans {
+			if cp.didExecAtPrepare {
+				// for mysql begin/start transaction
+				// exec already done instead of prepare
+				if logger.GetLogger().V(logger.Debug) {
+					logger.GetLogger().Log(logger.Debug, "didExecAtPrepare exec skip since exec'd at prepare")
+				}
+				nss := make([]*netstring.Netstring, 2)
+				nss[0] = netstring.NewNetstringFrom(common.RcValue, []byte("0")) // cols
+				nss[1] = netstring.NewNetstringFrom(common.RcValue, []byte("0")) // rows
+				// no bind outs
+				resns := netstring.NewNetstringEmbedded(nss)
+				cp.eor(common.EORInTransaction, resns)
+			} else if cp.inTrans {
 				cp.eor(common.EORInTransaction, netstring.NewNetstringFrom(common.RcSQLError, []byte(cp.lastErr.Error())))
 			} else {
 				cp.eor(common.EORFree, netstring.NewNetstringFrom(common.RcSQLError, []byte(cp.lastErr.Error())))
@@ -770,7 +797,8 @@ func (cp *CmdProcessor) InitDB() error {
 	cp.db.SetMaxOpenConns(1)
 
 	//
-	cp.sqlParser, err = common.NewRegexSQLParser()
+	// cp.sqlParser, err = common.NewRegexSQLParser()
+	cp.sqlParser, err = cp.adapter.MakeSqlParser()
 	if err != nil {
 		if logger.GetLogger().V(logger.Warning) {
 			logger.GetLogger().Log(logger.Warning, "bindname regex complie:", err.Error())
